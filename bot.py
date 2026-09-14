@@ -119,11 +119,13 @@ def send_message(chat_id, text):
     if not text:
         text = "Не получилось ничего посчитать — проверьте фото."
     for i in range(0, len(text), 4000):
-        requests.post(
+        r = requests.post(
             f"{TELEGRAM_API}/sendMessage",
             json={"chat_id": chat_id, "text": text[i:i + 4000]},
             timeout=30,
         )
+        if not r.ok:
+            logger.error("Telegram sendMessage failed: %s %s", r.status_code, r.text)
  
  
 def get_file_bytes(file_id):
@@ -141,6 +143,8 @@ def webhook():
         return "ok"
  
     chat_id = message["chat"]["id"]
+    logger.info("Incoming message: chat_id=%s chat_type=%s has_photo=%s",
+                chat_id, message["chat"].get("type"), "photo" in message)
  
     # Текстовые команды
     if "text" in message:
