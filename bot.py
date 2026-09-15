@@ -1,6 +1,8 @@
 import os
 import base64
 import logging
+import threading
+import time
 import requests
 from flask import Flask, request
 import anthropic
@@ -11,6 +13,14 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+ 
+# Список разрешённых chat_id через запятую, например: "590441036,-5225713707"
+# Пусто/не задано = бот отвечает всем (небезопасно, но удобно для первого теста).
+_allowed_raw = os.environ.get("ALLOWED_CHAT_IDS", "").strip()
+ALLOWED_CHAT_IDS = {int(x) for x in _allowed_raw.split(",") if x.strip()} if _allowed_raw else None
+ 
+# Сколько секунд ждать остальные фото из одного альбома, прежде чем считать
+MEDIA_GROUP_WAIT_SECONDS = 3
  
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 app = Flask(__name__)
@@ -23,6 +33,12 @@ SYSTEM_PROMPT = """
 Ты помогаешь считать китайские накладные/счета ОТК (таблицы с колонками
 数量 (кол-во), 单价 (цена за единицу), 账单预估运输费 (доставка), 款号 (код модели)
 и, возможно, 货拉拉运费差额 или другими мелкими сборами).
+ 
+Тебе может прийти ОДНА или НЕСКОЛЬКО фотографий (например, если таблица не
+влезла в один скрин и человек прислал 2-3 части одной таблицы, или несколько
+разных накладных сразу). Считай их все вместе как единый набор данных:
+объединяй одинаковые коды моделей между фотографиями точно так же, как
+объединяешь повторы внутри одной таблицы.
  
 МЕТОДИКА РАСЧЁТА (строго следуй этим правилам):
  
@@ -42,9 +58,9 @@ SYSTEM_PROMPT = """
    НЕ включаются. Их нужно вынести ОТДЕЛЬНЫМ списком в самом конце отчёта,
    каждую строку с пояснением: "вычет с прошлых оплат в связи с браком".
  
-5. Если один и тот же код модели (款号) встречается в таблице несколько раз
-   (в том числе в разных партиях внутри одной таблицы) — объединяй все эти
-   строки в одну: складывай количество, сумму и доставку.
+5. Если один и тот же код модели (款号) встречается в таблице (или на разных
+   фотографиях) несколько раз — объединяй все эти строки в одну: складывай
+   количество, сумму и доставку.
  
 6. Код модели заменяй на нормальное название товара по справочнику ниже.
    Если код в справочнике не найден — не выдумывай название, пиши только код.
@@ -113,6 +129,29 @@ F888 — Лонгслив F888 необработанный край
 только из пронумерованных строк "Название (код) — ..." и итога.
 """
  
+# ---------------------------------------------------------------------------
+# Буфер для альбомов (несколько фото, присланных одним сообщением-группой)
+# ---------------------------------------------------------------------------
+_media_groups_lock = threading.Lock()
+_media_groups = {}  # media_group_id -> {"chat_id": ..., "file_ids": [...], "timer": Timer}
+ 
+ 
+def is_allowed(chat_id):
+    if ALLOWED_CHAT_IDS is None:
+        return True
+    return chat_id in ALLOWED_CHAT_IDS
+ 
+ 
+def send_chat_action(chat_id, action="typing"):
+    try:
+        requests.post(
+            f"{TELEGRAM_API}/sendChatAction",
+            json={"chat_id": chat_id, "action": action},
+            timeout=10,
+        )
+    except Exception:
+        logger.exception("Не удалось отправить chat action")
+ 
  
 def send_message(chat_id, text):
     """Отправка сообщения с разбивкой на части (лимит Telegram — 4096 символов)."""
@@ -135,6 +174,64 @@ def get_file_bytes(file_id):
     return requests.get(file_url, timeout=30).content
  
  
+def process_photos(chat_id, file_ids):
+    """Считает одну или несколько фотографий вместе и присылает готовый отчёт."""
+    try:
+        # Держим индикатор "печатает" живым (сам статус живёт ~5 сек в Telegram)
+        stop_typing = threading.Event()
+ 
+        def typing_loop():
+            while not stop_typing.is_set():
+                send_chat_action(chat_id, "typing")
+                stop_typing.wait(4)
+ 
+        t = threading.Thread(target=typing_loop, daemon=True)
+        t.start()
+ 
+        content = []
+        for file_id in file_ids:
+            img_bytes = get_file_bytes(file_id)
+            img_b64 = base64.b64encode(img_bytes).decode()
+            content.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64},
+            })
+ 
+        prompt_text = (
+            "Посчитай эту таблицу по методике и выдай готовый отчёт."
+            if len(content) == 1
+            else f"Это {len(content)} фото одного набора данных (части одной таблицы или "
+                 f"несколько накладных). Посчитай их вместе по методике и выдай один "
+                 f"общий готовый отчёт."
+        )
+        content.append({"type": "text", "text": prompt_text})
+ 
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=8000,
+            thinking={"type": "enabled", "budget_tokens": 4000},
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": content}],
+        )
+        result_text = "".join(block.text for block in response.content if block.type == "text")
+ 
+        stop_typing.set()
+        send_message(chat_id, result_text)
+    except Exception:
+        logger.exception("Ошибка при обработке фото")
+        send_message(chat_id, "Не получилось обработать фото, попробуйте прислать ещё раз.")
+ 
+ 
+def schedule_media_group(media_group_id):
+    """Ждём немного, собираем все фото альбома, затем считаем разом."""
+    time.sleep(MEDIA_GROUP_WAIT_SECONDS)
+    with _media_groups_lock:
+        group = _media_groups.pop(media_group_id, None)
+    if not group:
+        return
+    process_photos(group["chat_id"], group["file_ids"])
+ 
+ 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     update = request.get_json(force=True, silent=True) or {}
@@ -146,14 +243,18 @@ def webhook():
     logger.info("Incoming message: chat_id=%s chat_type=%s has_photo=%s",
                 chat_id, message["chat"].get("type"), "photo" in message)
  
+    if not is_allowed(chat_id):
+        logger.info("Chat %s не в списке разрешённых — игнорирую", chat_id)
+        return "ok"
+ 
     # Текстовые команды
     if "text" in message:
         text = message["text"].strip()
         if text.startswith("/start") or text.startswith("/help"):
             send_message(
                 chat_id,
-                "Привет! Пришлите фото/скрин таблицы ОТК — посчитаю по нашей методике "
-                "и пришлю готовый отчёт списком.",
+                "Привет! Пришлите фото/скрин таблицы ОТК (можно сразу несколько) — "
+                "посчитаю по нашей методике и пришлю готовый отчёт списком.",
             )
         return "ok"
  
@@ -161,42 +262,24 @@ def webhook():
     if not photos:
         return "ok"
  
-    try:
-        largest = photos[-1]  # Telegram присылает несколько размеров, берём самый большой
-        img_bytes = get_file_bytes(largest["file_id"])
-        img_b64 = base64.b64encode(img_bytes).decode()
+    largest = photos[-1]  # Telegram присылает несколько размеров, берём самый большой
+    media_group_id = message.get("media_group_id")
  
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=8000,
-            thinking={"type": "enabled", "budget_tokens": 4000},
-            system=SYSTEM_PROMPT,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/jpeg",
-                                "data": img_b64,
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": "Посчитай эту таблицу по методике и выдай готовый отчёт.",
-                        },
-                    ],
-                }
-            ],
-        )
-        result_text = "".join(block.text for block in response.content if block.type == "text")
-        send_message(chat_id, result_text)
-    except Exception:
-        logger.exception("Ошибка при обработке фото")
-        send_message(chat_id, "Не получилось обработать фото, попробуйте прислать ещё раз.")
+    if media_group_id:
+        # Часть альбома — копим фото и запускаем таймер один раз на группу
+        with _media_groups_lock:
+            group = _media_groups.get(media_group_id)
+            if group is None:
+                group = {"chat_id": chat_id, "file_ids": []}
+                _media_groups[media_group_id] = group
+                threading.Thread(
+                    target=schedule_media_group, args=(media_group_id,), daemon=True
+                ).start()
+            group["file_ids"].append(largest["file_id"])
+        return "ok"
  
+    # Одиночное фото — считаем сразу в фоновом потоке, чтобы не держать вебхук
+    threading.Thread(target=process_photos, args=(chat_id, [largest["file_id"]]), daemon=True).start()
     return "ok"
  
  
