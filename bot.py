@@ -1,4 +1,5 @@
 import os
+import re
 import base64
 import logging
 import threading
@@ -29,9 +30,16 @@ MEDIA_GROUP_WAIT_SECONDS = 3
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 app = Flask(__name__)
 
+# Справочник артикулов общий с qc_bot: файл articles.txt в репозитории qc_bot.
+# Новые артикулы добавляйте только туда — сюда они подтянутся сами.
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+ARTICLES_URL = "https://api.github.com/repos/vitalikkim95-create/qc_bot/contents/articles.txt"
+ARTICLES_CACHE_SECONDS = 600
+ARTICLE_LINE = re.compile(r"^(.+?)\s+[—–-]\s+(.+)$")
+
 # ---------------------------------------------------------------------------
-# Методика расчёта + справочник названий моделей.
-# Отредактируйте этот блок, если правила или список артикулов изменятся.
+# Методика расчёта. Отредактируйте этот блок, если правила изменятся.
+# {ARTICLES} подставляется из общего справочника.
 # ---------------------------------------------------------------------------
 SYSTEM_PROMPT = """
 Ты помогаешь считать китайские накладные/счета ОТК (таблицы с колонками
@@ -70,27 +78,7 @@ SYSTEM_PROMPT = """
    Если код в справочнике не найден — не выдумывай название, пиши только код.
 
 СПРАВОЧНИК КОДОВ (款号 → название):
-F1110 (может писаться F110) — Лонгслив прозрачный
-911 — Пиджак с поясом
-1915 — Пиджак овер
-3311 (может писаться 3311-1) — Пиджак полоска
-3335 (может писаться 335) — Лонгслив 335 лодочка
-F898 — Лонгслив F898 прозрачный с завязками
-F888 — Лонгслив F888 необработанный край
-619 — Лонгслив 619 базовый
-8227 — Лонгслив 8227 кружево
-2666 — Водолазка 2666 двойная
-2667 — Водолазка 2667 рукав фонарик
-2668 — Лонгслив 2668 мэй-мэй
-2661 — Лонгслив белый воротник
-2766 — Боди вырез
-2836 — Боди пряжка
-8001 — Боди кружево
-2815 — Боди гипюр
-2612 — Боди стразы
-2779 — Боди сетка
-2816 — Боди длинный рукав
-8113 (может писаться 813) — Лонгслив 813 наша стойка
+{ARTICLES}
 
 Категории на паузе (если встретятся — не включай в отчёт и не запоминай):
 юбки, кардиганы, футболка.
@@ -138,6 +126,56 @@ F888 — Лонгслив F888 необработанный край
 # ---------------------------------------------------------------------------
 _media_groups_lock = threading.Lock()
 _media_groups = {}  # media_group_id -> {"chat_id": ..., "file_ids": [...], "timer": Timer}
+
+
+_articles_lock = threading.Lock()
+_articles_cache = {"text": "", "loaded_at": 0.0}
+
+
+def format_articles(text):
+    """articles.txt -> строки справочника для промпта."""
+    lines = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = ARTICLE_LINE.match(line)
+        if not match:
+            logger.warning("Строка справочника не разобрана: %s", line)
+            continue
+        codes = [c.strip() for c in match.group(1).split(",") if c.strip()]
+        name = match.group(2).strip()
+        name = name[:1].upper() + name[1:]
+        variants = f" (может писаться {', '.join(codes[1:])})" if len(codes) > 1 else ""
+        lines.append(f"{codes[0]}{variants} — {name}")
+    return "\n".join(lines)
+
+
+def load_articles():
+    """Справочник с GitHub, кэш на 10 минут; при ошибке — последняя удачная версия."""
+    with _articles_lock:
+        if time.time() - _articles_cache["loaded_at"] < ARTICLES_CACHE_SECONDS:
+            return _articles_cache["text"]
+        try:
+            r = requests.get(
+                ARTICLES_URL,
+                headers={
+                    "Authorization": f"Bearer {GITHUB_TOKEN}",
+                    "Accept": "application/vnd.github.raw",
+                },
+                timeout=15,
+            )
+            r.raise_for_status()
+            _articles_cache["text"] = format_articles(r.text)
+            _articles_cache["loaded_at"] = time.time()
+        except Exception:
+            logger.exception("Не удалось загрузить справочник артикулов с GitHub")
+        return _articles_cache["text"]
+
+
+def build_system_prompt():
+    articles = load_articles() or "(справочник сейчас недоступен — пиши только коды)"
+    return SYSTEM_PROMPT.replace("{ARTICLES}", articles)
 
 
 def is_allowed(chat_id):
@@ -235,7 +273,7 @@ def process_photos(chat_id, file_ids):
             model="claude-sonnet-4-6",
             max_tokens=8000,
             thinking={"type": "enabled", "budget_tokens": 4000},
-            system=SYSTEM_PROMPT,
+            system=build_system_prompt(),
             messages=[{"role": "user", "content": content}],
         )
         result_text = "".join(block.text for block in response.content if block.type == "text")
