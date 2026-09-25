@@ -168,6 +168,8 @@ def load_articles():
             r.raise_for_status()
             _articles_cache["text"] = format_articles(r.text)
             _articles_cache["loaded_at"] = time.time()
+            logger.info("Справочник артикулов загружен: %s моделей",
+                        len(_articles_cache["text"].splitlines()))
         except Exception:
             logger.exception("Не удалось загрузить справочник артикулов с GitHub")
         return _articles_cache["text"]
