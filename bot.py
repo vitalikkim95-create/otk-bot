@@ -253,20 +253,39 @@ def get_file_bytes(file_id):
     return requests.get(file_url, timeout=30).content
 
 
+def ask_claude(content):
+    """Запрос к Claude; если ответ пустой или обрезан по лимиту — одна повторная попытка."""
+    text = ""
+    for attempt in (1, 2):
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=16000,
+            thinking={"type": "adaptive"},
+            system=build_system_prompt(),
+            messages=[{"role": "user", "content": content}],
+        )
+        text = "".join(b.text for b in response.content if b.type == "text").strip()
+        logger.info(
+            "Claude, попытка %s: stop_reason=%s, output_tokens=%s, длина ответа=%s",
+            attempt, response.stop_reason, response.usage.output_tokens, len(text),
+        )
+        if text and response.stop_reason != "max_tokens":
+            return text
+    return text
+
+
 def process_photos(chat_id, file_ids):
     """Считает одну или несколько фотографий вместе и присылает готовый отчёт."""
+    # Держим индикатор "печатает" живым (сам статус живёт ~5 сек в Telegram)
+    stop_typing = threading.Event()
+
+    def typing_loop():
+        while not stop_typing.is_set():
+            send_chat_action(chat_id, "typing")
+            stop_typing.wait(4)
+
+    threading.Thread(target=typing_loop, daemon=True).start()
     try:
-        # Держим индикатор "печатает" живым (сам статус живёт ~5 сек в Telegram)
-        stop_typing = threading.Event()
-
-        def typing_loop():
-            while not stop_typing.is_set():
-                send_chat_action(chat_id, "typing")
-                stop_typing.wait(4)
-
-        t = threading.Thread(target=typing_loop, daemon=True)
-        t.start()
-
         content = []
         for file_id in file_ids:
             img_bytes = get_file_bytes(file_id)
@@ -285,20 +304,18 @@ def process_photos(chat_id, file_ids):
         )
         content.append({"type": "text", "text": prompt_text})
 
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=8000,
-            thinking={"type": "enabled", "budget_tokens": 4000},
-            system=build_system_prompt(),
-            messages=[{"role": "user", "content": content}],
-        )
-        result_text = "".join(block.text for block in response.content if block.type == "text")
-
+        result_text = ask_claude(content)
         stop_typing.set()
-        send_message(chat_id, result_text)
+        send_message(
+            chat_id,
+            result_text or "Не получилось посчитать с двух попыток — отправьте фото ещё раз.",
+        )
     except Exception:
         logger.exception("Ошибка при обработке фото")
+        stop_typing.set()
         send_message(chat_id, "Не получилось обработать фото, попробуйте прислать ещё раз.")
+    finally:
+        stop_typing.set()
 
 
 def schedule_media_group(media_group_id):
