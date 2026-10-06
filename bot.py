@@ -83,11 +83,10 @@ SYSTEM_PROMPT = """
    Если код в справочнике не найден — не выдумывай название, пиши только код.
 
 7. Сверка с накладной. Если в таблице есть общая сумма к оплате (待付款合计,
-   账单金额 или похожая), молча сверь с ней свой результат: сумма накладной
-   должна совпасть с "Общим итогом" за вычетом всех вычетов. Не совпало —
-   перепроверь распознавание цифр и правила 1-5. Если после перепроверки
-   всё равно не сходится (больше чем на 1 ю), добавь в самый конец ответа
-   одну строку:
+   账单金额 или похожая), один раз сверь с ней свой результат: сумма накладной
+   должна совпасть с "Общим итогом" за вычетом всех вычетов. Повторно таблицу
+   не пересчитывай. Если расхождение больше 1 ю — просто добавь в самый конец
+   ответа одну строку:
    Внимание: итог накладной X ю, по расчёту Y ю — проверьте вручную
 
 СПРАВОЧНИК КОДОВ (款号 → название):
@@ -254,20 +253,26 @@ def get_file_bytes(file_id):
 
 
 def ask_claude(content):
-    """Запрос к Claude; если ответ пустой или обрезан по лимиту — одна повторная попытка."""
+    """Запрос к Claude. Если ответа нет — повтор с меньшей глубиной размышлений."""
     text = ""
-    for attempt in (1, 2):
-        response = client.messages.create(
+    # effort ограничивает размышления: на high большие таблицы думались по 4+ минуты
+    for attempt, effort in ((1, "medium"), (2, "low")):
+        started = time.time()
+        with client.messages.stream(
             model="claude-sonnet-4-6",
-            max_tokens=16000,
+            max_tokens=32000,
             thinking={"type": "adaptive"},
+            output_config={"effort": effort},
             system=build_system_prompt(),
             messages=[{"role": "user", "content": content}],
-        )
+        ) as stream:
+            response = stream.get_final_message()
         text = "".join(b.text for b in response.content if b.type == "text").strip()
         logger.info(
-            "Claude, попытка %s: stop_reason=%s, output_tokens=%s, длина ответа=%s",
-            attempt, response.stop_reason, response.usage.output_tokens, len(text),
+            "Claude, попытка %s (effort=%s): stop_reason=%s, output_tokens=%s, "
+            "длина ответа=%s, %.0f сек",
+            attempt, effort, response.stop_reason, response.usage.output_tokens,
+            len(text), time.time() - started,
         )
         if text and response.stop_reason != "max_tokens":
             return text
