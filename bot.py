@@ -26,8 +26,15 @@ ALLOWED_CHAT_IDS = {int(x) for x in _allowed_raw.split(",") if x.strip()} if _al
 # когда его явно упомянули в группе.
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "").lstrip("@").lower()
 
+# Скрины, присланные файлом (без сжатия), тоже считаем. 5 МБ — лимит Claude на картинку.
+IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+
 # Сколько секунд ждать остальные фото из одного альбома, прежде чем считать
 MEDIA_GROUP_WAIT_SECONDS = 3
+
+if ALLOWED_CHAT_IDS is None:
+    logger.warning("ALLOWED_CHAT_IDS не задан — бот отвечает в любом чате и тратит деньги API")
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 app = Flask(__name__)
@@ -109,7 +116,7 @@ EXTRACT_SCHEMA = {
 # Буфер для альбомов (несколько фото, присланных одним сообщением-группой)
 # ---------------------------------------------------------------------------
 _media_groups_lock = threading.Lock()
-_media_groups = {}  # media_group_id -> {"chat_id": ..., "file_ids": [...], "timer": Timer}
+_media_groups = {}  # media_group_id -> {"chat_id": ..., "images": [(file_id, тип)], "mentioned": bool}
 
 
 _articles_lock = threading.Lock()
@@ -146,6 +153,18 @@ def is_allowed(chat_id):
     return chat_id in ALLOWED_CHAT_IDS
 
 
+def bot_username():
+    """Username бота: из BOT_USERNAME, а если не задан — у самого Telegram."""
+    global BOT_USERNAME
+    if not BOT_USERNAME:
+        try:
+            r = requests.get(f"{TELEGRAM_API}/getMe", timeout=10).json()
+            BOT_USERNAME = r["result"]["username"].lower()
+        except Exception:
+            logger.exception("Не удалось узнать username бота")
+    return BOT_USERNAME
+
+
 def is_mentioned(message):
     """В личке — всегда True. В группе — только если бота явно упомянули
     в подписи/тексте (@username) или ответили (reply) на его сообщение."""
@@ -153,18 +172,17 @@ def is_mentioned(message):
         return True
 
     # Reply на сообщение бота
-    reply = message.get("reply_to_message")
-    if reply and reply.get("from", {}).get("username", "").lower() == BOT_USERNAME:
-        return True
+    username = bot_username()
+    if not username:
+        return False
 
-    if not BOT_USERNAME:
-        # Username не задан — не можем проверить упоминание, пропускаем всё
-        # (чтобы не сломать работу бота, если переменную забыли задать)
+    reply = message.get("reply_to_message")
+    if reply and reply.get("from", {}).get("username", "").lower() == username:
         return True
 
     # Упоминание в подписи к фото или в тексте сообщения
     text = (message.get("caption") or message.get("text") or "").lower()
-    return f"@{BOT_USERNAME}" in text
+    return f"@{username}" in text
 
 
 def send_chat_action(chat_id, action="typing"):
@@ -183,13 +201,16 @@ def send_message(chat_id, text):
     if not text:
         text = "Не получилось ничего посчитать — проверьте фото."
     for i in range(0, len(text), 4000):
-        r = requests.post(
-            f"{TELEGRAM_API}/sendMessage",
-            json={"chat_id": chat_id, "text": text[i:i + 4000]},
-            timeout=30,
-        )
-        if not r.ok:
-            logger.error("Telegram sendMessage failed: %s %s", r.status_code, r.text)
+        try:
+            r = requests.post(
+                f"{TELEGRAM_API}/sendMessage",
+                json={"chat_id": chat_id, "text": text[i:i + 4000]},
+                timeout=30,
+            )
+            if not r.ok:
+                logger.error("Telegram sendMessage failed: %s %s", r.status_code, r.text)
+        except Exception:
+            logger.exception("Не удалось отправить сообщение в Telegram")
 
 
 def get_file_bytes(file_id):
@@ -232,7 +253,7 @@ def extract_rows(content):
     return None
 
 
-def process_photos(chat_id, file_ids):
+def process_photos(chat_id, images):
     """Считает одну или несколько фотографий вместе и присылает готовый отчёт."""
     # Держим индикатор "печатает" живым (сам статус живёт ~5 сек в Telegram)
     stop_typing = threading.Event()
@@ -245,12 +266,16 @@ def process_photos(chat_id, file_ids):
     threading.Thread(target=typing_loop, daemon=True).start()
     try:
         content = []
-        for file_id in file_ids:
+        for file_id, media_type in images:
             img_bytes = get_file_bytes(file_id)
+            if len(img_bytes) > MAX_IMAGE_BYTES:
+                stop_typing.set()
+                send_message(chat_id, "Картинка больше 5 МБ — пришлите скрин как фото, а не файлом.")
+                return
             img_b64 = base64.b64encode(img_bytes).decode()
             content.append({
                 "type": "image",
-                "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64},
+                "source": {"type": "base64", "media_type": media_type, "data": img_b64},
             })
 
         content.append({"type": "text", "text": "Перепиши таблицу с фото в JSON."})
@@ -277,7 +302,7 @@ def schedule_media_group(media_group_id):
         group = _media_groups.pop(media_group_id, None)
     if not group or not group["mentioned"]:
         return
-    process_photos(group["chat_id"], group["file_ids"])
+    process_photos(group["chat_id"], group["images"])
 
 
 @app.route("/webhook", methods=["POST"])
@@ -288,8 +313,8 @@ def webhook():
         return "ok"
 
     chat_id = message["chat"]["id"]
-    logger.info("Incoming message: chat_id=%s chat_type=%s has_photo=%s",
-                chat_id, message["chat"].get("type"), "photo" in message)
+    logger.info("Incoming message: chat_id=%s chat_type=%s has_photo=%s has_document=%s",
+                chat_id, message["chat"].get("type"), "photo" in message, "document" in message)
 
     if not is_allowed(chat_id):
         logger.info("Chat %s не в списке разрешённых — игнорирую", chat_id)
@@ -311,10 +336,15 @@ def webhook():
         return "ok"
 
     photos = message.get("photo")
-    if not photos:
+    document = message.get("document") or {}
+    if photos:
+        # Telegram присылает несколько размеров, берём самый большой
+        image = (photos[-1]["file_id"], "image/jpeg")
+    elif document.get("mime_type") in IMAGE_TYPES:
+        image = (document["file_id"], document["mime_type"])
+    else:
         return "ok"
 
-    largest = photos[-1]  # Telegram присылает несколько размеров, берём самый большой
     media_group_id = message.get("media_group_id")
 
     if media_group_id:
@@ -324,12 +354,12 @@ def webhook():
         with _media_groups_lock:
             group = _media_groups.get(media_group_id)
             if group is None:
-                group = {"chat_id": chat_id, "file_ids": [], "mentioned": False}
+                group = {"chat_id": chat_id, "images": [], "mentioned": False}
                 _media_groups[media_group_id] = group
                 threading.Thread(
                     target=schedule_media_group, args=(media_group_id,), daemon=True
                 ).start()
-            group["file_ids"].append(largest["file_id"])
+            group["images"].append(image)
             if mentioned:
                 group["mentioned"] = True
         return "ok"
@@ -338,7 +368,7 @@ def webhook():
         return "ok"
 
     # Одиночное фото — считаем сразу в фоновом потоке, чтобы не держать вебхук
-    threading.Thread(target=process_photos, args=(chat_id, [largest["file_id"]]), daemon=True).start()
+    threading.Thread(target=process_photos, args=(chat_id, [image]), daemon=True).start()
     return "ok"
 
 

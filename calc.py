@@ -23,11 +23,12 @@ def parse_articles(text):
 
 
 def money(value):
-    return f"{round(value, 2):.2f}".rstrip("0").rstrip(".").replace("-", "−")
+    # + 0.0 убирает «−0» у сумм, округлившихся до нуля
+    return f"{round(value, 2) + 0.0:.2f}".rstrip("0").rstrip(".").replace("-", "−")
 
 
 def qty_str(value):
-    return f"{value:g}"
+    return str(int(value)) if float(value).is_integer() else f"{value:g}"
 
 
 def calculate(rows, articles):
@@ -83,7 +84,9 @@ def calculate(rows, articles):
 
 
 def label(item):
-    return f"{item['name']} ({item['code']})" if item["name"] else item["code"]
+    if item["name"]:
+        return f"{item['name']} ({item['code']})"
+    return item["code"] or "без кода"
 
 
 def build_report(data, articles):
