@@ -1,5 +1,5 @@
 import os
-import re
+import json
 import base64
 import logging
 import threading
@@ -7,6 +7,8 @@ import time
 import requests
 from flask import Flask, request
 import anthropic
+
+from calc import build_report, parse_articles
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -35,104 +37,73 @@ app = Flask(__name__)
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 ARTICLES_URL = "https://api.github.com/repos/vitalikkim95-create/qc_bot/contents/articles.txt"
 ARTICLES_CACHE_SECONDS = 600
-ARTICLE_LINE = re.compile(r"^(.+?)\s+[—–-]\s+(.+)$")
 
 # ---------------------------------------------------------------------------
-# Методика расчёта. Отредактируйте этот блок, если правила изменятся.
-# {ARTICLES} подставляется из общего справочника.
+# Claude только переписывает таблицу с фото. Вся методика расчёта — в calc.py.
 # ---------------------------------------------------------------------------
-SYSTEM_PROMPT = """
-Ты помогаешь считать китайские накладные/счета ОТК (таблицы с колонками
-数量 (кол-во), 单价 (цена за единицу), 账单预估运输费 (доставка), 款号 (код модели)
-и, возможно, 货拉拉运费差额 или другими мелкими сборами).
+EXTRACT_PROMPT = """
+Ты переписываешь в JSON таблицы с фото китайских накладных ОТК.
+Ничего не считай и не исправляй — перепиши строки точно так, как они в таблице.
 
-Тебе может прийти ОДНА или НЕСКОЛЬКО фотографий (например, если таблица не
-влезла в один скрин и человек прислал 2-3 части одной таблицы, или несколько
-разных накладных сразу). Считай их все вместе как единый набор данных:
-объединяй одинаковые коды моделей между фотографиями точно так же, как
-объединяешь повторы внутри одной таблицы.
+Колонки таблицы: 分点 (склад), 产品 (товар), 数量 (кол-во), 单价 (цена),
+金额 (сумма), 账单预估运输费 (доставка), 款号 (код модели),
+账单金额 (сумма счёта), 待付款合计 (итого к оплате).
 
-МЕТОДИКА РАСЧЁТА (строго следуй этим правилам):
+Перепиши КАЖДУЮ строку таблицы, включая строки сборов (货拉拉运费差额,
+增值服务（抽检费） и подобные):
+- invoice: номер счёта 1, 2, 3… Счёт — блок строк с одной датой 账单日期 и одной
+  ячейкой 账单金额. Номера сквозные по всем фото.
+- product: 产品 как написано.
+- code: 款号 как написано; если в ячейке несколько кодов — как есть, через /.
+- qty: 数量 числом, со знаком минус, если он есть; "/" или пусто — null.
+- unit_price: 单价 числом; "/" или пусто — null.
+- amount: 金额 числом, со знаком; пусто — null.
+- delivery_group и delivery_amount: если одна ячейка 账单预估运输费 объединена на
+  несколько строк — у всех этих строк одинаковый delivery_group (например "1-a")
+  и delivery_amount = число из этой ячейки. Если у строки своя ячейка с числом —
+  свой отдельный delivery_group. Если в ячейке "/" или пусто — оба null.
+- paused: true, если товар — юбка (裙), кардиган (开衫) или футболка с коротким
+  рукавом (短袖T恤, 短袖); иначе false. 长袖 (длинный рукав) — это false.
 
-1. Для каждой строки считаешь: 数量 × 单价. НЕ используй готовое значение из
-   столбца 金额, если оно отличается от 数量×单价 — всегда пересчитывай сам.
+grand_total: сумма всех чисел 待付款合计 на фото. Если 待付款合计 нет — сумма всех
+账单金额. Если нет и их — null.
 
-2. Доставка (账单预估运输费) обычно указана одной ячейкой на группу строк
-   (объединённая ячейка в таблице). Определи, какие строки относятся к
-   какой группе доставки, и прибавь сумму доставки к строке с МАКСИМАЛЬНЫМ
-   数量 внутри этой группы. Остальные строки группы — без доставки.
-
-3. Мелкие дополнительные сборы (货拉拉运费差额, 抽检费 "проверка" и подобные,
-   если у них нет своего 数量) — прибавляй к доставке любой крупной позиции
-   того же счёта (неважно, к какой именно — сумма всегда небольшая).
-
-4. Вычет — это ТОЛЬКО строка, у которой 数量 со знаком минус (например -120).
-   Такие строки в основной расчёт НЕ включаются: вынеси их ОТДЕЛЬНЫМ списком
-   в самом конце отчёта, каждую с пояснением "вычет с прошлых оплат в связи
-   с браком".
-   Пометка 预估 в названии товара сама по себе НЕ означает вычет. 预估 с
-   положительным 数量 — это оплата партии, которая ещё не отгружена (рядом
-   обычно написано 预计…完成出货). Такие строки считай как самые обычные:
-   включай в основной расчёт вместе с их доставкой и объединяй по коду модели.
-
-5. Если один и тот же код модели (款号) встречается в таблице (или на разных
-   фотографиях) несколько раз — объединяй все эти строки в одну: складывай
-   количество, сумму и доставку.
-
-6. Код модели заменяй на нормальное название товара по справочнику ниже.
-   Если код в справочнике не найден — не выдумывай название, пиши только код.
-
-7. Сверка с накладной. Если в таблице есть общая сумма к оплате (待付款合计,
-   账单金额 или похожая), один раз сверь с ней свой результат: сумма накладной
-   должна совпасть с "Общим итогом" за вычетом всех вычетов. Повторно таблицу
-   не пересчитывай. Если расхождение больше 1 ю — просто добавь в самый конец
-   ответа одну строку:
-   Внимание: итог накладной X ю, по расчёту Y ю — проверьте вручную
-
-СПРАВОЧНИК КОДОВ (款号 → название):
-{ARTICLES}
-
-Категории на паузе (если встретятся — не включай в отчёт и не запоминай):
-юбки, кардиганы, футболка.
-
-Коды 8862 и 806 — названия пока не заданы, если встретятся, пиши просто код.
-
-ФОРМАТ ИТОГОВОГО ОТВЕТА (строго):
-
-Пронумерованный список, каждая позиция в формате:
-Название (код) — X шт: Y ю, доставка Z ю
-
-— если доставка равна 0, эту часть строки не пиши вообще (просто "X шт: Y ю")
-— никаких лишних слов и пояснений внутри позиций
-
-После списка положительных позиций — строка:
-Общий итог: N ю
-
-Если есть отрицательные строки (брак) — после общего итога добавь отдельный
-список:
-Название/код — X шт: −Y ю (вычет с прошлых оплат в связи с браком)
-
-КРИТИЧЕСКИ ВАЖНО ПРО ФОРМАТ ОТВЕТА — читай внимательно, это не рекомендация,
-а жёсткое требование:
-
-Твой ответ пользователю должен состоять ТОЛЬКО из:
-1. Пронумерованного списка позиций в формате "Название (код) — X шт: Y ю[, доставка Z ю]"
-2. Строки "Общий итог: N ю"
-3. (если есть брак) списка вычетов
-4. (только если сверка из правила 7 не сошлась) строки "Внимание: ..."
-
-И БОЛЬШЕ НИЧЕГО. Даже одного лишнего слова быть не должно.
-
-ЗАПРЕЩЕНО применять эти правила прямо в ответе — весь разбор, группировку по
-分点/городам (Дунгуань, Гуанчжоу и т.п.), восстановление строк, промежуточные
-списки "- код: X×Y=Z" делай молча, про себя, не выводя их в текст ответа.
-Пользователь должен увидеть только финальный чистый список, как будто ты
-сразу знал ответ — без слов "сначала", "разберу", "восстановлю", "замечу",
-без markdown-заголовков и звёздочек, без построчного проговаривания таблицы.
-
-Если засомневался в формате — вспомни: хороший ответ короткий, состоит
-только из пронумерованных строк "Название (код) — ..." и итога.
+Если несколько фото — это части одной таблицы или разные накладные. Строку,
+которая видна сразу на двух фото, переписывай один раз.
 """
+
+_NUMBER_OR_NULL = {"anyOf": [{"type": "number"}, {"type": "null"}]}
+_STRING_OR_NULL = {"anyOf": [{"type": "string"}, {"type": "null"}]}
+EXTRACT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "rows": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "invoice": {"type": "integer"},
+                    "product": {"type": "string"},
+                    "code": {"type": "string"},
+                    "qty": _NUMBER_OR_NULL,
+                    "unit_price": _NUMBER_OR_NULL,
+                    "amount": _NUMBER_OR_NULL,
+                    "delivery_group": _STRING_OR_NULL,
+                    "delivery_amount": _NUMBER_OR_NULL,
+                    "paused": {"type": "boolean"},
+                },
+                "required": [
+                    "invoice", "product", "code", "qty", "unit_price", "amount",
+                    "delivery_group", "delivery_amount", "paused",
+                ],
+                "additionalProperties": False,
+            },
+        },
+        "grand_total": _NUMBER_OR_NULL,
+    },
+    "required": ["rows", "grand_total"],
+    "additionalProperties": False,
+}
 
 # ---------------------------------------------------------------------------
 # Буфер для альбомов (несколько фото, присланных одним сообщением-группой)
@@ -142,33 +113,14 @@ _media_groups = {}  # media_group_id -> {"chat_id": ..., "file_ids": [...], "tim
 
 
 _articles_lock = threading.Lock()
-_articles_cache = {"text": "", "loaded_at": 0.0}
-
-
-def format_articles(text):
-    """articles.txt -> строки справочника для промпта."""
-    lines = []
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        match = ARTICLE_LINE.match(line)
-        if not match:
-            logger.warning("Строка справочника не разобрана: %s", line)
-            continue
-        codes = [c.strip() for c in match.group(1).split(",") if c.strip()]
-        name = match.group(2).strip()
-        name = name[:1].upper() + name[1:]
-        variants = f" (может писаться {', '.join(codes[1:])})" if len(codes) > 1 else ""
-        lines.append(f"{codes[0]}{variants} — {name}")
-    return "\n".join(lines)
+_articles_cache = {"articles": {}, "loaded_at": 0.0}
 
 
 def load_articles():
     """Справочник с GitHub, кэш на 10 минут; при ошибке — последняя удачная версия."""
     with _articles_lock:
         if time.time() - _articles_cache["loaded_at"] < ARTICLES_CACHE_SECONDS:
-            return _articles_cache["text"]
+            return _articles_cache["articles"]
         try:
             r = requests.get(
                 ARTICLES_URL,
@@ -179,18 +131,13 @@ def load_articles():
                 timeout=15,
             )
             r.raise_for_status()
-            _articles_cache["text"] = format_articles(r.text)
+            _articles_cache["articles"] = parse_articles(r.text)
             _articles_cache["loaded_at"] = time.time()
             logger.info("Справочник артикулов загружен: %s моделей",
-                        len(_articles_cache["text"].splitlines()))
+                        len(set(_articles_cache["articles"].values())))
         except Exception:
             logger.exception("Не удалось загрузить справочник артикулов с GitHub")
-        return _articles_cache["text"]
-
-
-def build_system_prompt():
-    articles = load_articles() or "(справочник сейчас недоступен — пиши только коды)"
-    return SYSTEM_PROMPT.replace("{ARTICLES}", articles)
+        return _articles_cache["articles"]
 
 
 def is_allowed(chat_id):
@@ -252,31 +199,37 @@ def get_file_bytes(file_id):
     return requests.get(file_url, timeout=30).content
 
 
-def ask_claude(content):
-    """Запрос к Claude. Если ответа нет — повтор с меньшей глубиной размышлений."""
-    text = ""
-    # effort ограничивает размышления: на high большие таблицы думались по 4+ минуты
-    for attempt, effort in ((1, "medium"), (2, "low")):
+def extract_rows(content):
+    """Claude переписывает таблицу с фото в JSON. При сбое — одна повторная попытка."""
+    for attempt in (1, 2):
         started = time.time()
         with client.messages.stream(
             model="claude-sonnet-4-6",
-            max_tokens=32000,
+            max_tokens=16000,
             thinking={"type": "adaptive"},
-            output_config={"effort": effort},
-            system=build_system_prompt(),
+            output_config={
+                "effort": "low",
+                "format": {"type": "json_schema", "schema": EXTRACT_SCHEMA},
+            },
+            system=EXTRACT_PROMPT,
             messages=[{"role": "user", "content": content}],
         ) as stream:
             response = stream.get_final_message()
-        text = "".join(b.text for b in response.content if b.type == "text").strip()
+        text = "".join(b.text for b in response.content if b.type == "text")
+        data = None
+        if response.stop_reason == "end_turn":
+            try:
+                data = json.loads(text)
+            except ValueError:
+                pass
         logger.info(
-            "Claude, попытка %s (effort=%s): stop_reason=%s, output_tokens=%s, "
-            "длина ответа=%s, %.0f сек",
-            attempt, effort, response.stop_reason, response.usage.output_tokens,
-            len(text), time.time() - started,
+            "Claude, попытка %s: stop_reason=%s, output_tokens=%s, строк=%s, %.0f сек",
+            attempt, response.stop_reason, response.usage.output_tokens,
+            len(data["rows"]) if data else "-", time.time() - started,
         )
-        if text and response.stop_reason != "max_tokens":
-            return text
-    return text
+        if data and data["rows"]:
+            return data
+    return None
 
 
 def process_photos(chat_id, file_ids):
@@ -300,16 +253,10 @@ def process_photos(chat_id, file_ids):
                 "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64},
             })
 
-        prompt_text = (
-            "Посчитай эту таблицу по методике и выдай готовый отчёт."
-            if len(content) == 1
-            else f"Это {len(content)} фото одного набора данных (части одной таблицы или "
-                 f"несколько накладных). Посчитай их вместе по методике и выдай один "
-                 f"общий готовый отчёт."
-        )
-        content.append({"type": "text", "text": prompt_text})
+        content.append({"type": "text", "text": "Перепиши таблицу с фото в JSON."})
 
-        result_text = ask_claude(content)
+        data = extract_rows(content)
+        result_text = build_report(data, load_articles()) if data else ""
         stop_typing.set()
         send_message(
             chat_id,
