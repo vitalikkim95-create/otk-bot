@@ -167,7 +167,7 @@ def bot_username():
 
 def is_mentioned(message):
     """В личке — всегда True. В группе — только если бота явно упомянули
-    в подписи/тексте (@username) или ответили (reply) на его сообщение."""
+    в подписи/тексте (@username)."""
     if message["chat"].get("type") not in ("group", "supergroup"):
         return True
 
@@ -176,10 +176,8 @@ def is_mentioned(message):
     if not username:
         return False
 
-    reply = message.get("reply_to_message")
-    if reply and reply.get("from", {}).get("username", "").lower() == username:
-        return True
-
+    # Ответ (reply) на сообщение бота упоминанием не считается: в ответ на отчёт
+    # присылают, например, скрин оплаты, и считать его не нужно.
     # Упоминание в подписи к фото или в тексте сообщения
     text = (message.get("caption") or message.get("text") or "").lower()
     return f"@{username}" in text
@@ -248,7 +246,8 @@ def extract_rows(content):
             attempt, response.stop_reason, response.usage.output_tokens,
             len(data["rows"]) if data else "-", time.time() - started,
         )
-        if data and data["rows"]:
+        if data is not None:
+            # Пустой список строк — честный ответ «таблицы на фото нет», повтор не нужен.
             return data
     return None
 
@@ -281,12 +280,13 @@ def process_photos(chat_id, images):
         content.append({"type": "text", "text": "Перепиши таблицу с фото в JSON."})
 
         data = extract_rows(content)
-        result_text = build_report(data, load_articles()) if data else ""
+        if data is None:
+            result_text = "Не получилось посчитать с двух попыток — отправьте фото ещё раз."
+        else:
+            result_text = (build_report(data, load_articles())
+                           or "На фото не нашёл таблицу накладной — нечего считать.")
         stop_typing.set()
-        send_message(
-            chat_id,
-            result_text or "Не получилось посчитать с двух попыток — отправьте фото ещё раз.",
-        )
+        send_message(chat_id, result_text)
     except Exception:
         logger.exception("Ошибка при обработке фото")
         stop_typing.set()
