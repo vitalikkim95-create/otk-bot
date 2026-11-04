@@ -56,6 +56,7 @@ EXTRACT_PROMPT = """
 金额 (сумма), 账单预估运输费 (доставка), 款号 (код модели),
 账单金额 (сумма счёта), 待付款合计 (итого к оплате).
 
+Строки выдавай строго в том порядке, как они идут в таблице сверху вниз.
 Перепиши КАЖДУЮ строку таблицы, включая строки сборов (货拉拉运费差额,
 增值服务（抽检费） и подобные):
 - invoice: номер счёта 1, 2, 3… Счёт — блок строк с одной датой 账单日期 и одной
@@ -65,10 +66,14 @@ EXTRACT_PROMPT = """
 - qty: 数量 числом, со знаком минус, если он есть; "/" или пусто — null.
 - unit_price: 单价 числом; "/" или пусто — null.
 - amount: 金额 числом, со знаком; пусто — null.
-- delivery_group и delivery_amount: если одна ячейка 账单预估运输费 объединена на
-  несколько строк — у всех этих строк одинаковый delivery_group (например "1-a")
-  и delivery_amount = число из этой ячейки. Если у строки своя ячейка с числом —
-  свой отдельный delivery_group. Если в ячейке "/" или пусто — оба null.
+- delivery_amount и delivery_rows — ячейка 账单预估运输费 (доставка):
+  * на строке, где ячейка доставки НАЧИНАЕТСЯ: delivery_amount = число в ячейке,
+    delivery_rows = на сколько строк таблицы эта ячейка растянута по высоте
+    (своя ячейка у одной строки — 1; объединённая на 7 строк — 7);
+  * на остальных строках, которые накрыты той же объединённой ячейкой, и на
+    строках с "/" или пустой ячейкой: оба null.
+  Две соседние отдельные ячейки с одинаковым числом (например 300 и 300) — это
+  две разные ячейки: у каждой своя строка с delivery_rows = 1.
 - paused: true, если товар — юбка (裙), кардиган (开衫) или футболка с коротким
   рукавом (短袖T恤, 短袖); иначе false. 长袖 (длинный рукав) — это false.
 
@@ -95,13 +100,13 @@ EXTRACT_SCHEMA = {
                     "qty": _NUMBER_OR_NULL,
                     "unit_price": _NUMBER_OR_NULL,
                     "amount": _NUMBER_OR_NULL,
-                    "delivery_group": _STRING_OR_NULL,
                     "delivery_amount": _NUMBER_OR_NULL,
+                    "delivery_rows": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
                     "paused": {"type": "boolean"},
                 },
                 "required": [
                     "invoice", "product", "code", "qty", "unit_price", "amount",
-                    "delivery_group", "delivery_amount", "paused",
+                    "delivery_amount", "delivery_rows", "paused",
                 ],
                 "additionalProperties": False,
             },
@@ -247,6 +252,7 @@ def extract_rows(content):
             len(data["rows"]) if data else "-", time.time() - started,
         )
         if data is not None:
+            logger.info("Строки с фото: %s", json.dumps(data, ensure_ascii=False))
             # Пустой список строк — честный ответ «таблицы на фото нет», повтор не нужен.
             return data
     return None

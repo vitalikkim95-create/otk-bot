@@ -33,6 +33,10 @@ def qty_str(value):
 
 def calculate(rows, articles):
     """Применяет правила 1-6 методики. rows — строки таблицы как их переписал Claude."""
+    # Индексы считаем по исходному порядку строк: от них зависят ячейки доставки.
+    for i, r in enumerate(rows):
+        r["_pos"] = i
+    all_rows = rows
     rows = [r for r in rows if not r.get("paused")]
     goods = [r for r in rows if r.get("qty") is not None]
     fees = [r for r in rows if r.get("qty") is None and r.get("amount")]
@@ -45,20 +49,29 @@ def calculate(rows, articles):
 
     positive = [r for r in goods if r["qty"] > 0]
 
-    # Правило 2: доставка группы — к строке с максимальным количеством в группе.
-    groups = {}
-    for r in positive:
-        if r.get("delivery_group") and r.get("delivery_amount"):
-            groups.setdefault((r["invoice"], r["delivery_group"]), []).append(r)
-    for members in groups.values():
-        biggest = max(members, key=lambda r: r["qty"])
-        biggest["delivery"] += members[0]["delivery_amount"]
+    def biggest_in_invoice(invoice):
+        same = [r for r in positive if r["invoice"] == invoice] or positive
+        return max(same, key=lambda r: r["qty"]) if same else None
+
+    # Правило 2: доставка ячейки — к строке с максимальным количеством среди строк,
+    # которые эта ячейка накрывает. Каждая ячейка учитывается ровно один раз.
+    for start in all_rows:
+        amount = start.get("delivery_amount")
+        if not amount or start.get("paused"):
+            continue
+        span = max(start.get("delivery_rows") or 1, 1)
+        covered = {start["_pos"] + k for k in range(span)}
+        members = [r for r in positive if r["_pos"] in covered]
+        target = (max(members, key=lambda r: r["qty"]) if members
+                  else biggest_in_invoice(start["invoice"]))
+        if target:
+            target["delivery"] += amount
 
     # Правило 3: мелкие сборы — к доставке самой крупной позиции того же счёта.
     for fee in fees:
-        same_invoice = [r for r in positive if r["invoice"] == fee["invoice"]] or positive
-        if same_invoice:
-            max(same_invoice, key=lambda r: r["qty"])["delivery"] += fee["amount"]
+        target = biggest_in_invoice(fee["invoice"])
+        if target:
+            target["delivery"] += fee["amount"]
 
     def resolve(code):
         found = articles.get(str(code).strip().upper())
