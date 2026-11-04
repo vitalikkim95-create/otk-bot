@@ -67,27 +67,32 @@ def calculate(rows, articles):
         if target:
             target["delivery"] += amount
 
-    # Правило 3: мелкие сборы — к доставке самой крупной позиции того же счёта.
-    for fee in fees:
-        target = biggest_in_invoice(fee["invoice"])
+    # Правила 3 и 4: мелкие сборы и минусовые строки меняют только доставку самой
+    # крупной позиции того же счёта. Штуки и сумма за проверку остаются как в накладной.
+    unallocated = 0.0
+    adjustments = [(r["invoice"], r["amount"]) for r in fees]
+    adjustments += [(r["invoice"], r["line"]) for r in goods if r["qty"] < 0]
+    for invoice, amount in adjustments:
+        target = biggest_in_invoice(invoice)
         if target:
-            target["delivery"] += fee["amount"]
+            target["delivery"] += amount
+        else:
+            unallocated += amount
 
     def resolve(code):
         found = articles.get(str(code).strip().upper())
         return found if found else (str(code).strip(), None)
 
-    # Правила 4-6: объединяем по коду модели вместе с минусовыми строками, поэтому
-    # сумма всех строк отчёта равна сумме к оплате. Названия — из справочника.
+    # Правила 5 и 6: объединяем по коду модели, названия — из справочника.
     positions = {}
-    for r in goods:
+    for r in positive:
         code, name = resolve(r["code"])
         pos = positions.setdefault(code, {"code": code, "name": name, "qty": 0, "sum": 0.0, "delivery": 0.0})
         pos["qty"] += r["qty"]
         pos["sum"] += r["line"]
         pos["delivery"] += r["delivery"]
 
-    return [p for p in positions.values() if p["qty"] or round(p["sum"], 2) or round(p["delivery"], 2)]
+    return list(positions.values()), unallocated
 
 
 def label(item):
@@ -98,19 +103,18 @@ def label(item):
 
 def build_report(data, articles):
     """Возвращает (отчёт, предупреждение). В отчёте после итога ничего нет."""
-    positions = calculate(data["rows"], articles)
-    if not positions:
+    positions, unallocated = calculate(data["rows"], articles)
+    if not positions and not unallocated:
         return "", None
 
     lines = []
     for i, pos in enumerate(positions, start=1):
-        qty = qty_str(pos["qty"]).replace("-", "−")
-        line = f"{i}. {label(pos)} — {qty} шт: {money(pos['sum'])} ю"
+        line = f"{i}. {label(pos)} — {qty_str(pos['qty'])} шт: {money(pos['sum'])} ю"
         if round(pos["delivery"], 2):
             line += f", доставка {money(pos['delivery'])} ю"
         lines.append(line)
 
-    total = sum(p["sum"] + p["delivery"] for p in positions)
+    total = sum(p["sum"] + p["delivery"] for p in positions) + unallocated
     lines += ["", f"К оплате: {money(total)} ю"]
 
     # Правило 7: сверка с итогом накладной. Предупреждение — отдельным сообщением.
