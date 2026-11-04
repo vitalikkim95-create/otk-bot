@@ -288,11 +288,14 @@ def process_photos(chat_id, images):
         data = extract_rows(content)
         if data is None:
             result_text = "Не получилось посчитать с двух попыток — отправьте фото ещё раз."
+            warning = None
         else:
-            result_text = (build_report(data, load_articles())
-                           or "На фото не нашёл таблицу накладной — нечего считать.")
+            report, warning = build_report(data, load_articles())
+            result_text = report or "На фото не нашёл таблицу накладной — нечего считать."
         stop_typing.set()
         send_message(chat_id, result_text)
+        if warning:
+            send_message(chat_id, warning)
     except Exception:
         logger.exception("Ошибка при обработке фото")
         stop_typing.set()

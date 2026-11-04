@@ -77,23 +77,17 @@ def calculate(rows, articles):
         found = articles.get(str(code).strip().upper())
         return found if found else (str(code).strip(), None)
 
-    # Правила 5 и 6: объединяем по коду модели, названия — из справочника.
+    # Правила 4-6: объединяем по коду модели вместе с минусовыми строками, поэтому
+    # сумма всех строк отчёта равна сумме к оплате. Названия — из справочника.
     positions = {}
-    for r in positive:
+    for r in goods:
         code, name = resolve(r["code"])
         pos = positions.setdefault(code, {"code": code, "name": name, "qty": 0, "sum": 0.0, "delivery": 0.0})
         pos["qty"] += r["qty"]
         pos["sum"] += r["line"]
         pos["delivery"] += r["delivery"]
 
-    # Правило 4: вычет — только строка с отрицательным количеством.
-    deductions = []
-    for r in goods:
-        if r["qty"] < 0:
-            code, name = resolve(r["code"])
-            deductions.append({"code": code, "name": name, "qty": -r["qty"], "sum": r["line"]})
-
-    return list(positions.values()), deductions
+    return [p for p in positions.values() if p["qty"] or round(p["sum"], 2) or round(p["delivery"], 2)]
 
 
 def label(item):
@@ -103,37 +97,27 @@ def label(item):
 
 
 def build_report(data, articles):
-    positions, deductions = calculate(data["rows"], articles)
-    if not positions and not deductions:
-        return ""
+    """Возвращает (отчёт, предупреждение). В отчёте после итога ничего нет."""
+    positions = calculate(data["rows"], articles)
+    if not positions:
+        return "", None
 
     lines = []
     for i, pos in enumerate(positions, start=1):
-        line = f"{i}. {label(pos)} — {qty_str(pos['qty'])} шт: {money(pos['sum'])} ю"
+        qty = qty_str(pos["qty"]).replace("-", "−")
+        line = f"{i}. {label(pos)} — {qty} шт: {money(pos['sum'])} ю"
         if round(pos["delivery"], 2):
             line += f", доставка {money(pos['delivery'])} ю"
         lines.append(line)
 
     total = sum(p["sum"] + p["delivery"] for p in positions)
-    lines += ["", f"Общий итог: {money(total)} ю"]
+    lines += ["", f"К оплате: {money(total)} ю"]
 
-    if deductions:
-        lines.append("")
-        for d in deductions:
-            lines.append(
-                f"{label(d)} — {qty_str(d['qty'])} шт: {money(d['sum'])} ю "
-                "(вычет с прошлых оплат в связи с браком)"
-            )
-
-    # Правило 7: сверка с итогом накладной.
+    # Правило 7: сверка с итогом накладной. Предупреждение — отдельным сообщением.
+    warning = None
     invoice_total = data.get("grand_total")
-    if invoice_total is not None:
-        calculated = total + sum(d["sum"] for d in deductions)
-        if abs(calculated - invoice_total) > 1:
-            lines += [
-                "",
-                f"Внимание: итог накладной {money(invoice_total)} ю, "
-                f"по расчёту {money(calculated)} ю — проверьте вручную",
-            ]
+    if invoice_total is not None and abs(total - invoice_total) > 1:
+        warning = (f"Внимание: итог накладной {money(invoice_total)} ю, "
+                   f"по расчёту {money(total)} ю — проверьте вручную")
 
-    return "\n".join(lines)
+    return "\n".join(lines), warning
